@@ -91,6 +91,6 @@ void vicon::callback(void* userdata, const vrpn_TRACKERCB tdata) {
     self->R_vm(2, 1) = 2 * tdata.quat[0] * tdata.quat[3] + 2 * tdata.quat[2] * tdata.quat[1];
     self->R_vm(2, 2) = 1 - 2 * (tdata.quat[0] * tdata.quat[0]) - 2 * (tdata.quat[1] * tdata.quat[1]);
 
-    std::cout << "\nx_v: " << self->x_v.transpose() << std::endl;
-    std::cout << "R_vm: " << self->R_vm << std::endl;
+    // std::cout << "\nx_v: " << self->x_v.transpose() << std::endl;
+    // std::cout << "R_vm: " << self->R_vm << std::endl;
 }

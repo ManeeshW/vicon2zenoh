@@ -27,6 +27,7 @@ public:
     bool noise_x_enabled = false; /**< Flag to enable/disable position noise */
     bool noise_R_enabled = false; /**< Flag to enable/disable rotation noise */
     Eigen::Matrix3d R_sv = Eigen::Matrix3d::Identity(); /**< Transformation matrix from Vicon to ship frame */
+    Eigen::Matrix3d  R_off = Eigen::Matrix3d::Identity();
     Eigen::Vector3d x_pose_sync = Eigen::Vector3d::Zero(); /**< Position in ship frame */
     Eigen::Matrix3d R_pose_sync = Eigen::Matrix3d::Identity(); /**< Rotation in ship frame */
     double timestamp = 0.0; /**< Timestamp of last pose data */

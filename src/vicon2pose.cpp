@@ -107,10 +107,13 @@ void vicon2pose::loop() {
         auto [x_v, R_vm] = vicon_instance.loop();
         std::lock_guard<std::mutex> lock(pose_mutex);
         PoseData data;
+        R_off << -1.0, 0.0, 0.0,
+            0.0, -1.0, 0.0,
+            0.0, 0.0, 1.0;
         data.x_pose = R_sv * x_v;
         data.x_pose(0) = -data.x_pose(0);
         data.x_pose(1) = -data.x_pose(1);
-        data.R_pose = R_sv * R_vm;
+        data.R_pose = R_off * R_sv * R_vm;
         data.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         data.collect_time = now;
         data.noise_x = Eigen::Vector3d::Zero();
