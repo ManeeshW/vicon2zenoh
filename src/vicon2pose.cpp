@@ -114,7 +114,7 @@ void vicon2pose::loop() {
         data.x_pose(0) = -data.x_pose(0);
         data.x_pose(1) = -data.x_pose(1);
         data.R_pose = R_off * R_sv * R_vm;
-        data.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        data.timestamp = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();  // seconds
         data.collect_time = now;
         data.noise_x = Eigen::Vector3d::Zero();
         data.noise_angles = Eigen::Vector3d::Zero();
@@ -164,25 +164,23 @@ void vicon2pose::loop() {
         if (time_since_collect >= latency) {
             // Prepare JSON payload
             nlohmann::json j;
-            j["image_taken_time"] = data.timestamp;
-            std::vector<std::vector<double>> pose_data(3, std::vector<double>(4));
+            j["measured_time"] = data.timestamp;
+            j["position"] = {data.x_pose(0), data.x_pose(1), data.x_pose(2)};
+            nlohmann::json orientation = nlohmann::json::array();
             for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    pose_data[i][j] = static_cast<double>(data.R_pose(i, j));
-                }
-                pose_data[i][3] = static_cast<double>(data.x_pose(i));
+                nlohmann::json row = {data.R_pose(i, 0), data.R_pose(i, 1), data.R_pose(i, 2)};
+                orientation.push_back(row);
             }
-            j["pose"] = pose_data;
-            j["noise_x"] = {data.noise_x(0), data.noise_x(1), data.noise_x(2)};
-            j["noise_angles"] = {data.noise_angles(0), data.noise_angles(1), data.noise_angles(2)};
+            j["orientation"] = orientation;
+            double system_time = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+            j["system_time"] = system_time;
             // Publish via Zenoh
             try {
                 publisher->put(j.dump());
-                std::cout << "VICON2POSE: Published - t: " << data.timestamp
-                          << ", x_pose: " << data.x_pose.transpose()
-                          << ", R_pose:\n" << data.R_pose
-                          << ", noise_x: " << data.noise_x.transpose()
-                          << ", noise_angles: " << data.noise_angles.transpose() << std::endl;
+                std::cout << "VICON2POSE: Published - measured_time: " << data.timestamp
+                          << ", system_time: " << system_time
+                          << ", position: " << data.x_pose.transpose()
+                          << ", orientation:\n" << data.R_pose << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "VICON2POSE: Publish error - " << e.what() << std::endl;
             }

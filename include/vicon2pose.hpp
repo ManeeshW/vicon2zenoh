@@ -1,4 +1,4 @@
-#ifndef VICON2POSE_HPP
+ #ifndef VICON2POSE_HPP
 #define VICON2POSE_HPP
 
 #include "vicon.hpp"
@@ -18,7 +18,7 @@ public:
     ~vicon2pose();
 
     bool on = false; /**< Flag to enable/disable vicon2pose */
-    std::string zenoh_key = "fdcl/pose_sync"; /**< Zenoh publisher key */
+    std::string zenoh_key = "pose"; /**< Zenoh publisher key */
     double latency = 0.5; /**< Latency in seconds for delayed publishing */
     double frequency = 5.0; /**< Frequency in Hz for data collection */
     double dt_desired = 0.2; /**< Desired loop time (1/frequency) for data collection */
@@ -45,7 +45,7 @@ private:
     struct PoseData {
         Eigen::Vector3d x_pose;
         Eigen::Matrix3d R_pose;
-        double timestamp;
+        double timestamp;  // Changed to seconds
         std::chrono::steady_clock::time_point collect_time;
         Eigen::Vector3d noise_x; /**< Noise applied to position */
         Eigen::Vector3d noise_angles; /**< Noise angles applied to rotation */
