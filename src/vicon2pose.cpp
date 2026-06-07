@@ -72,6 +72,11 @@ void vicon2pose::load_config(const std::string& config_file) {
             value.erase(0, value.find_first_not_of(" \t"));
             value.erase(value.find_last_not_of(" \t") + 1);
             noise_R_enabled = (value == "true" || value == "1");
+        } else if (line.find("position_only:") != std::string::npos) {   // ← NEW
+            std::string value = line.substr(line.find("position_only:") + 14);
+            value.erase(0, value.find_first_not_of(" \t"));
+            value.erase(value.find_last_not_of(" \t") + 1);
+            position_only = (value == "true" || value == "1");
         }
     }
     file.close();
@@ -79,7 +84,8 @@ void vicon2pose::load_config(const std::string& config_file) {
               << ", latency: " << latency << "s, frequency: " << frequency
               << "Hz, dt_desired: " << dt_desired << "s, std_x: " << std_x
               << ", std_R: " << std_R << ", noise_x_enabled: " << noise_x_enabled
-              << ", noise_R_enabled: " << noise_R_enabled << std::endl;
+              << ", noise_R_enabled: " << noise_R_enabled
+              << ", position_only: " << position_only << std::endl;   // ← updated
 }
 
 void vicon2pose::open() {
@@ -113,7 +119,15 @@ void vicon2pose::loop() {
         data.x_pose = R_sv * x_v;
         data.x_pose(0) = -data.x_pose(0);
         data.x_pose(1) = -data.x_pose(1);
-        data.R_pose = R_off * R_sv * R_vm;
+        data.R_pose = R_off * R_sv * R_vm;   // real attitude by default
+
+        // ============== NEW: POSITION_ONLY MODE ==============
+        if (position_only) {
+            data.R_pose = -Eigen::Matrix3d::Identity();  // fake negative identity
+            data.noise_angles = Eigen::Vector3d::Zero();
+        }
+        // =====================================================
+
         data.timestamp = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         data.collect_time = now;
         data.noise_x = Eigen::Vector3d::Zero();
@@ -128,8 +142,8 @@ void vicon2pose::loop() {
             std::cout << "VICON2POSE: Applied position noise: " << data.noise_x.transpose() << std::endl;
         }
 
-        // Add noise to rotation if enabled
-        if (noise_R_enabled && std_R > 0.0) {
+        // Add noise to rotation if enabled (disabled in position_only mode)
+        if (noise_R_enabled && std_R > 0.0 && !position_only) {
             // Generate small angle rotations around x, y, z axes
             data.noise_angles(0) = std_R * dist(rng);
             data.noise_angles(1) = std_R * dist(rng);
@@ -182,7 +196,8 @@ void vicon2pose::loop() {
                           << ", x_pose: " << data.x_pose.transpose()
                           << ", R_pose:\n" << data.R_pose
                           << ", noise_x: " << data.noise_x.transpose()
-                          << ", noise_angles: " << data.noise_angles.transpose() << std::endl;
+                          << ", noise_angles: " << data.noise_angles.transpose()
+                          << (position_only ? " [POSITION_ONLY mode]" : "") << std::endl;
             } catch (const std::exception& e) {
                 std::cerr << "VICON2POSE: Publish error - " << e.what() << std::endl;
             }

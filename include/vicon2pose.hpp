@@ -26,6 +26,7 @@ public:
     double std_R = 0.0; /**< Standard deviation for rotation noise */
     bool noise_x_enabled = false; /**< Flag to enable/disable position noise */
     bool noise_R_enabled = false; /**< Flag to enable/disable rotation noise */
+    bool position_only = false; /**< NEW: When true, send real position + fake attitude (keeps JSON compatible) */
     Eigen::Matrix3d R_sv = Eigen::Matrix3d::Identity(); /**< Transformation matrix from Vicon to ship frame */
     Eigen::Matrix3d  R_off = Eigen::Matrix3d::Identity();
     Eigen::Vector3d x_pose_sync = Eigen::Vector3d::Zero(); /**< Position in ship frame */
