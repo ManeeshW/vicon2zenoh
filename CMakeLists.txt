@@ -14,47 +14,82 @@ find_package(zenohc REQUIRED)
 find_package(zenohcxx REQUIRED)
 find_package(nlohmann_json 3.2.0 REQUIRED)
 
-if (NOT VRPN_LIB)
-    message(FATAL_ERROR "VRPN library not found. Please install VRPN.")
-endif()
-if (NOT QUAT_LIB)
-    message(FATAL_ERROR "Quat library not found. Please install quatlib.")
-endif()
+# Qt6 (optional — only the GUI target requires it)
+find_package(Qt6 COMPONENTS Core Widgets Charts QUIET
+    PATHS /usr/lib/x86_64-linux-gnu/cmake)
 
-# Include directories
-include_directories(${PROJECT_SOURCE_DIR}/include)
-include_directories(${EIGEN3_INCLUDE_DIRS})
-include_directories(${zenohc_INCLUDE_DIRS})
+# ── Vicon tracker (requires VRPN + Quat) ────────────────────────────────────
+if (VRPN_LIB AND QUAT_LIB)
+    include_directories(${PROJECT_SOURCE_DIR}/include)
+    include_directories(${EIGEN3_INCLUDE_DIRS})
+    include_directories(${zenohc_INCLUDE_DIRS})
 
-# Source files for vicon_tracker library
-set(vicon_src src/vicon2pose.cpp src/vicon.cpp)
+    set(vicon_src src/vicon2pose.cpp src/vicon.cpp)
 
-# Create static library
-add_library(vicon_tracker_static STATIC ${vicon_src})
-target_include_directories(vicon_tracker_static PUBLIC
-    ${PROJECT_SOURCE_DIR}/include
-)
-target_link_libraries(vicon_tracker_static PUBLIC
-    ${VRPN_LIB}
-    ${QUAT_LIB}
-    zenohcxx::zenohc
-    nlohmann_json::nlohmann_json
-    Eigen3::Eigen
-)
+    add_library(vicon_tracker_static STATIC ${vicon_src})
+    target_include_directories(vicon_tracker_static PUBLIC
+        ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(vicon_tracker_static PUBLIC
+        ${VRPN_LIB}
+        ${QUAT_LIB}
+        zenohcxx::zenohc
+        nlohmann_json::nlohmann_json
+        Eigen3::Eigen
+    )
 
-# Add executable
-add_executable(test_vicon_tracker src/main.cpp)
-target_link_libraries(test_vicon_tracker PRIVATE
-    vicon_tracker_static
-    ${VRPN_LIB}
-    ${QUAT_LIB}
-    zenohcxx::zenohc
-    nlohmann_json::nlohmann_json
-)
+    add_executable(test_vicon_tracker src/main.cpp)
+    target_link_libraries(test_vicon_tracker PRIVATE
+        vicon_tracker_static
+        ${VRPN_LIB}
+        ${QUAT_LIB}
+        zenohcxx::zenohc
+        nlohmann_json::nlohmann_json
+    )
 
-# Conditionally set compile options based on compiler
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    target_compile_options(test_vicon_tracker PRIVATE -Wall -O3 -Wno-class-memaccess)
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        target_compile_options(test_vicon_tracker PRIVATE -Wall -O3 -Wno-class-memaccess)
+    else()
+        target_compile_options(test_vicon_tracker PRIVATE -Wall -O3)
+    endif()
+
+    message(STATUS "VRPN found — test_vicon_tracker target enabled.")
 else()
-    target_compile_options(test_vicon_tracker PRIVATE -Wall -O3)
+    message(WARNING "VRPN or Quat library not found — test_vicon_tracker will NOT be built.")
+endif()
+
+# ── GUI target (requires Qt6 Core + Widgets + Charts) ────────────────────────
+if (Qt6_FOUND)
+    set(CMAKE_AUTOMOC ON)
+    set(CMAKE_AUTORCC ON)
+    set(CMAKE_AUTOUIC ON)
+
+    add_executable(vicon_gui
+        src/gui_main.cpp
+        src/vicon_gui.cpp
+        include/vicon_gui.hpp
+    )
+
+    target_include_directories(vicon_gui PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+    )
+
+    target_link_libraries(vicon_gui PRIVATE
+        Qt6::Core
+        Qt6::Widgets
+        Qt6::Charts
+        zenohcxx::zenohc
+        nlohmann_json::nlohmann_json
+        Eigen3::Eigen
+    )
+
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+        target_compile_options(vicon_gui PRIVATE -Wall -O2 -Wno-class-memaccess)
+    else()
+        target_compile_options(vicon_gui PRIVATE -Wall -O2)
+    endif()
+
+    message(STATUS "Qt6 found (${Qt6_VERSION}) — vicon_gui target enabled.")
+else()
+    message(WARNING "Qt6 not found — vicon_gui target will NOT be built.")
 endif()
