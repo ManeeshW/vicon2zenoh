@@ -12,6 +12,22 @@
 #include <queue>
 #include <random>
 
+// 1-D Constant-Acceleration Kalman filter (state: [pos, vel, acc], measurement: pos)
+struct KalmanCA1D {
+    Eigen::Vector3d x = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d P = Eigen::Matrix3d::Identity() * 10.0;
+    bool initialized  = false;
+    double update(double z, double dt, double q, double r);
+};
+
+// 1-D Constant-Velocity Kalman filter (state: [omega, alpha], measurement: raw omega)
+struct KalmanCV1D {
+    Eigen::Vector2d x = Eigen::Vector2d::Zero();
+    Eigen::Matrix2d P = Eigen::Matrix2d::Identity() * 10.0;
+    bool initialized  = false;
+    double update(double z, double dt, double q, double r);
+};
+
 class vicon2pose {
 public:
     vicon2pose();
@@ -58,6 +74,29 @@ private:
     std::queue<PoseData> pose_buffer; /**< Buffer to store pose data with timestamps */
     std::mt19937 rng; /**< Random number generator for noise */
     std::normal_distribution<double> dist; /**< Normal distribution for noise */
+
+    // Fast publisher (no noise, no latency, independent 200 Hz rate)
+    std::string     fast_key    = "fdcl/pose_sync_fast";
+    bool            fast_enable = false;
+    double          fast_dt     = 0.005; // 200 Hz
+    std::chrono::steady_clock::time_point fast_last_collect_time;
+    std::optional<zenoh::Publisher> fast_publisher;
+
+    // GT state (Kalman-filtered pos/vel/R/omega, zero-latency)
+    std::string     gt_state_key        = "fdcl/gt_state";
+    bool            gt_state_enable     = false;
+    bool            gt_transform_enable = false;
+    Eigen::Matrix3d T_gt                = Eigen::Matrix3d::Identity();
+    double          kf_q_pos            = 1.0;
+    double          kf_r_pos            = 1e-6;
+    double          kf_q_omega          = 5.0;
+    double          kf_r_omega          = 0.04;
+    KalmanCA1D      kf_pos[3];
+    KalmanCV1D      kf_omega[3];
+    Eigen::Matrix3d R_gt_prev           = Eigen::Matrix3d::Identity();
+    double          gt_prev_ts          = 0.0;
+    bool            gt_has_prev         = false;
+    std::optional<zenoh::Publisher> gt_state_pub;
 };
 
 #endif
