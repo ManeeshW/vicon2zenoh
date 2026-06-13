@@ -153,9 +153,9 @@ private:
     std::string rel_gt_state_key    = "fdcl/rel_gt_state";
     bool        rel_gt_state_enable = true;
 
-    // Output-frame transform for rel_gt_state (T @ pos, T @ R @ T^T, T @ vel, T @ omega)
+    // Output-frame transform for rel_gt_state (T @ pos, T @ R @ T^T, det(T)*T @ omega)
     bool            rel_pose_transform_enable = true;
-    Eigen::Matrix3d T_rel = (Eigen::Matrix3d() << 0,1,0, 1,0,0, 0,0,1).finished();
+    Eigen::Matrix3d T_rel = Eigen::Matrix3d::Identity();
 
     // Kalman filter parameters
     double kf_q_pos   = 1.0;     // CA process noise spectral density (m/s^3)

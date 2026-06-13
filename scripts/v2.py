@@ -16,11 +16,6 @@ _R_OFF = np.array([[-1.0, 0.0, 0.0],
                    [0.0,  0.0, 1.0]])
 _VICON_TO_BODY = _R_OFF @ _R_SV  # [[0,1,0],[-1,0,0],[0,0,1]]
 
-# Default output-frame transform for rel_gt_state  (swaps X and Y)
-_T_REL = np.array([[0, 1, 0],
-                   [1, 0, 0],
-                   [0, 0, 1]], dtype=float)
-
 
 # ---------------------------------------------------------------------------
 # Kalman filters
@@ -236,9 +231,12 @@ class Vicon2Zenoh:
         kf_r_omega=0.04,
     )
 
+    _DEFAULT_T_REL = np.eye(3)
+
     def __init__(self, config_file="../config_py.cfg"):
         for k, v in self._DEFAULTS.items():
             setattr(self, k, v)
+        self.T_rel = self._DEFAULT_T_REL.copy()
         self.dt_desired = 1.0 / self.frequency
         self._object_overrides = {}  # {int index -> dict of override values}
 
@@ -303,6 +301,10 @@ class Vicon2Zenoh:
                         self.rel_gt_state_enable = val.lower() in ("true", "1")
                     elif key == "rel_pose_transform_enable":
                         self.rel_pose_transform_enable = val.lower() in ("true", "1")
+                    elif key == "rel_pose_transform":
+                        vals = [float(x.strip()) for x in val.split(",")]
+                        if len(vals) == 9:
+                            self.T_rel = np.array(vals, dtype=float).reshape(3, 3)
                     elif key == "kf_q_pos":
                         self.kf_q_pos = float(val)
                     elif key == "kf_r_pos":
@@ -334,7 +336,7 @@ class Vicon2Zenoh:
                             except (ValueError, IndexError):
                                 pass
             rgs = self.rel_gt_state_key if self.rel_gt_state_enable else "disabled"
-            T_str = "on [[0,1,0],[1,0,0],[0,0,1]]" if self.rel_pose_transform_enable else "off"
+            T_str = f"on {self.T_rel.tolist()}" if self.rel_pose_transform_enable else "off"
             print(
                 f"[Vicon2Zenoh] Config: {len(self.object_names)} objects, "
                 f"f={self.frequency}Hz, latency={self.latency}s, "
@@ -448,12 +450,13 @@ class Vicon2Zenoh:
                         self._R_rel_prev  = R_rel.copy()
                         self._rel_prev_ts = ts_sec
 
-                        # Apply output-frame transform: T * v, T * R * T^T (T is symmetric)
-                        T = _T_REL if self.rel_pose_transform_enable else np.eye(3)
+                        # Apply output-frame transform: T * v, T * R * T^T (T is symmetric).
+                        # omega is a pseudovector and requires the det(T) factor under improper T.
+                        T = self.T_rel if self.rel_pose_transform_enable else np.eye(3)
                         pos_out   = T @ x_rel
                         vel_out   = T @ v_filt
                         R_out     = T @ R_rel @ T.T
-                        omega_out = T @ omega_filt
+                        omega_out = np.linalg.det(T) * T @ omega_filt
 
                         R_mat = [[float(R_out[r, c]) for c in range(3)] for r in range(3)]
                         payload = json.dumps({

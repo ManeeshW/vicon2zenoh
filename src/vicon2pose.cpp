@@ -280,6 +280,15 @@ void vicon2pose::load_config(const std::string& config_file) {
             rel_gt_state_enable = (v == "true" || v == "1");
         } else if (!(v = val_of("rel_pose_transform_enable:")).empty()) {
             rel_pose_transform_enable = (v == "true" || v == "1");
+        } else if (!(v = val_of("rel_pose_transform:")).empty()) {
+            auto vals = split_csv(v);
+            if (vals.size() == 9) {
+                try {
+                    for (int r = 0; r < 3; ++r)
+                        for (int c = 0; c < 3; ++c)
+                            T_rel(r, c) = std::stod(vals[r * 3 + c]);
+                } catch (...) {}
+            }
         } else if (!(v = val_of("kf_q_pos:")).empty()) {
             try { kf_q_pos = std::stod(v); } catch (...) {}
         } else if (!(v = val_of("kf_r_pos:")).empty()) {
@@ -434,14 +443,15 @@ void vicon2pose::queue_and_drain_relative_pose() {
                     R_rel_prev  = R_rel;
                     rel_prev_ts = ts_sec;
 
-                    // Apply output-frame transform: T * v, T * R * T^T (T is symmetric)
+                    // Apply output-frame transform: T * v, T * R * T^T (T is symmetric).
+                    // omega is a pseudovector and requires the det(T) factor under improper T.
                     const Eigen::Matrix3d& T = rel_pose_transform_enable
                                                ? T_rel
                                                : Eigen::Matrix3d::Identity();
                     Eigen::Vector3d pos_out   = T * x_rel;
                     Eigen::Vector3d vel_out   = T * v_filt;
                     Eigen::Matrix3d R_out     = T * R_rel * T.transpose();
-                    Eigen::Vector3d omega_out = T * omega_filt;
+                    Eigen::Vector3d omega_out = T.determinant() * T * omega_filt;
 
                     std::vector<std::vector<double>> R_mat(3, std::vector<double>(3));
                     for (int r = 0; r < 3; ++r)
