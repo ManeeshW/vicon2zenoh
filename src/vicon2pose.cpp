@@ -189,6 +189,10 @@ void vicon2pose::load_config(const std::string& config_file) {
             try { kf_q_omega = std::stod(line.substr(line.find("kf_q_omega:") + 11)); } catch (...) {}
         } else if (line.find("kf_r_omega:") != std::string::npos) {
             try { kf_r_omega = std::stod(line.substr(line.find("kf_r_omega:") + 11)); } catch (...) {}
+        } else if (line.find("vel_smooth_alpha:") != std::string::npos) {
+            try { vel_smooth_alpha = std::stod(line.substr(line.find("vel_smooth_alpha:") + 17)); } catch (...) {}
+        } else if (line.find("omega_smooth_alpha:") != std::string::npos) {
+            try { omega_smooth_alpha = std::stod(line.substr(line.find("omega_smooth_alpha:") + 19)); } catch (...) {}
         }
     }
     file.close();
@@ -201,7 +205,8 @@ void vicon2pose::load_config(const std::string& config_file) {
               << ", gt_state=" << (gt_state_enable ? gt_state_key : "disabled")
               << ", gt_transform=" << (gt_transform_enable ? "on" : "off")
               << ", KF: q_pos=" << kf_q_pos << " r_pos=" << kf_r_pos
-              << " q_omega=" << kf_q_omega << " r_omega=" << kf_r_omega << std::endl;
+              << " q_omega=" << kf_q_omega << " r_omega=" << kf_r_omega
+              << ", EMA: vel_alpha=" << vel_smooth_alpha << " omega_alpha=" << omega_smooth_alpha << std::endl;
 }
 
 void vicon2pose::open() {
@@ -357,6 +362,18 @@ void vicon2pose::loop() {
                     Eigen::Vector3d omega_filt;
                     for (int ax = 0; ax < 3; ++ax)
                         omega_filt(ax) = kf_omega[ax].update(omega_raw(ax), dt, kf_q_omega, kf_r_omega);
+
+                    // EMA post-filter: second smoothing stage on top of Kalman
+                    if (!smooth_has_prev) {
+                        v_smooth_prev     = v_filt;
+                        omega_smooth_prev = omega_filt;
+                        smooth_has_prev   = true;
+                    } else {
+                        v_filt     = vel_smooth_alpha   * v_filt     + (1.0 - vel_smooth_alpha)   * v_smooth_prev;
+                        omega_filt = omega_smooth_alpha * omega_filt + (1.0 - omega_smooth_alpha) * omega_smooth_prev;
+                        v_smooth_prev     = v_filt;
+                        omega_smooth_prev = omega_filt;
+                    }
 
                     R_gt_prev  = R_clean;
                     gt_prev_ts = ts_sec;

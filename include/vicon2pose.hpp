@@ -91,8 +91,13 @@ private:
     double          kf_r_pos            = 1e-6;
     double          kf_q_omega          = 5.0;
     double          kf_r_omega          = 0.04;
+    double          vel_smooth_alpha    = 1.0;   // EMA alpha for velocity (1=off, <1=smoother)
+    double          omega_smooth_alpha  = 1.0;   // EMA alpha for omega   (1=off, <1=smoother)
     KalmanCA1D      kf_pos[3];
     KalmanCV1D      kf_omega[3];
+    Eigen::Vector3d v_smooth_prev       = Eigen::Vector3d::Zero();
+    Eigen::Vector3d omega_smooth_prev   = Eigen::Vector3d::Zero();
+    bool            smooth_has_prev     = false;
     Eigen::Matrix3d R_gt_prev           = Eigen::Matrix3d::Identity();
     double          gt_prev_ts          = 0.0;
     bool            gt_has_prev         = false;

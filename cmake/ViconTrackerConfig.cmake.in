@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Eigen3 REQUIRED)
+find_dependency(zenohc REQUIRED)
+find_dependency(zenohcxx REQUIRED)
+find_dependency(nlohmann_json 3.2.0 REQUIRED)
+
+include("${CMAKE_CURRENT_LIST_DIR}/ViconTrackerTargets.cmake")
+
+check_required_components(ViconTracker)
