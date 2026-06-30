@@ -27,7 +27,7 @@ include_directories(${EIGEN3_INCLUDE_DIRS})
 include_directories(${zenohc_INCLUDE_DIRS})
 
 # Source files for vicon_tracker library
-set(vicon_src src/vicon2pose.cpp src/vicon.cpp)
+set(vicon_src src/vicon2pose.cpp src/vicon.cpp src/relative_pose.cpp src/display.cpp)
 
 # Create static library
 add_library(vicon_tracker_static STATIC ${vicon_src})

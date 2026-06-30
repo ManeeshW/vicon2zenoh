@@ -1,9 +1,10 @@
 #include "vicon.hpp"
 #include <fstream>
 #include <iostream>
+#include <vrpn_Connection.h>
 
 vicon::vicon() : tracker(nullptr), x_v(Eigen::Vector3d::Zero()), R_vm(Eigen::Matrix3d::Identity()) {
-    loadConfig("../config.cfg");
+    // Object name is provided via open(string); loadConfig is kept for standalone use only
 }
 
 vicon::~vicon() {
@@ -15,7 +16,13 @@ void vicon::open() {
 }
 
 void vicon::open(std::string object_name) {
-    tracker = new vrpn_Tracker_Remote(object_name.c_str());
+    // local_port=0 lets the OS assign a free port for each tracker's server socket,
+    // preventing "vrpn_Endpoint: mainloop: Bad listen socket" warnings when multiple
+    // trackers are created simultaneously (both would otherwise fight over port 3883).
+    vrpn_Connection* conn = vrpn_get_connection_by_name(
+        object_name.c_str(), nullptr, nullptr, nullptr, nullptr, 0);
+    tracker = new vrpn_Tracker_Remote(object_name.c_str(), conn);
+    conn->removeReference();  // tracker holds its own ref; release ours
     tracker->register_change_handler(this, vicon::callback);
     on = true;
     std::cout << "VICON: Tracker opened for " << object_name << std::endl;
