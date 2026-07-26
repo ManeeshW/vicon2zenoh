@@ -34,6 +34,16 @@ public:
 
     Eigen::Matrix3d R_sv;
     Eigen::Matrix3d R_off;
+
+    // NED-frame conversion: R_nv (vicon/ENU -> NED), R_im (marker -> IMU mounting).
+    // Both are self-inverse/symmetric, so the same matrix works in either direction.
+    // Used for all main-path output and (unless fast_legacy_frame) fast-path output.
+    Eigen::Matrix3d R_nv;
+    Eigen::Matrix3d R_im;
+
+    // When true, the fast_key publish keeps the legacy (pre-NED) R_sv/R_off transform
+    // instead of the NED transform. x_clean_latest is always NED regardless of this flag.
+    bool fast_legacy_frame = false;
     Eigen::Vector3d x_pose_sync = Eigen::Vector3d::Zero();
     Eigen::Matrix3d R_pose_sync = Eigen::Matrix3d::Identity();
     double timestamp = 0.0;

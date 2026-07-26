@@ -10,6 +10,15 @@ import os
 
 # ── Kalman filters (used by RelativePosePublisher for velocity estimation) ───
 
+def _gate_innovation(innovation, S, gate_sigma):
+    """Clip innovation to +/- gate_sigma*sqrt(S) so a single glitched measurement
+    can't inject a step change into the filter state. gate_sigma <= 0 disables gating."""
+    if gate_sigma <= 0.0:
+        return innovation
+    bound = gate_sigma * np.sqrt(S)
+    return max(-bound, min(bound, innovation))
+
+
 class KalmanCA1D:
     """1-D Constant-Acceleration Kalman filter. State: [pos, vel, acc]. Meas: pos."""
     def __init__(self):
@@ -17,7 +26,7 @@ class KalmanCA1D:
         self.P = np.eye(3) * 10.0
         self.initialized = False
 
-    def update(self, z, dt, q, r):
+    def update(self, z, dt, q, r, gate_sigma=0.0):
         if not self.initialized:
             self.x[0] = z
             self.initialized = True
@@ -32,8 +41,9 @@ class KalmanCA1D:
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + Q
         S = self.P[0, 0] + r
+        innovation = _gate_innovation(z - self.x[0], S, gate_sigma)
         K = self.P[:, 0] / S
-        self.x += K * (z - self.x[0])
+        self.x += K * innovation
         self.P -= np.outer(K, self.P[0, :])
         return self.x[1]
 
@@ -45,7 +55,7 @@ class KalmanCV1D:
         self.P = np.eye(2) * 10.0
         self.initialized = False
 
-    def update(self, z, dt, q, r):
+    def update(self, z, dt, q, r, gate_sigma=0.0):
         if not self.initialized:
             self.x[0] = z
             self.initialized = True
@@ -57,8 +67,9 @@ class KalmanCV1D:
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + Q
         S = self.P[0, 0] + r
+        innovation = _gate_innovation(z - self.x[0], S, gate_sigma)
         K = self.P[:, 0] / S
-        self.x += K * (z - self.x[0])
+        self.x += K * innovation
         self.P -= np.outer(K, self.P[0, :])
         return self.x[0]
 
@@ -117,6 +128,15 @@ class ObjectTracker:
                       [0.0, -1.0, 0.0],
                       [0.0,  0.0, 1.0]])
 
+    # NED-frame conversion: R_nv (vicon/ENU -> NED), R_im (marker -> IMU mounting).
+    # Both are self-inverse/symmetric, so the same matrix works in either direction.
+    R_nv = np.array([[-1.0, 0.0,  0.0],
+                     [ 0.0, 1.0,  0.0],
+                     [ 0.0, 0.0, -1.0]])
+    R_im = np.array([[0.0, 1.0,  0.0],
+                     [1.0, 0.0,  0.0],
+                     [0.0, 0.0, -1.0]])
+
     def __init__(self, section_name):
         self.section = section_name
         self.on = False
@@ -135,6 +155,9 @@ class ObjectTracker:
         self.fast_enable = False
         self.fast_frequency = 200.0
         self.fast_dt = 1.0 / 200.0
+        # When True, the fast_key publish keeps the legacy (pre-NED) R_sv/R_off transform
+        # instead of the NED transform. x_clean_latest is always NED regardless of this flag.
+        self.fast_legacy_frame = False
 
         # Clean (pre-noise) pose — shared with RelativePosePublisher
         self.x_clean_latest = np.zeros(3)
@@ -180,11 +203,13 @@ class ObjectTracker:
         self.fast_enable    = _bool('fast_enable', False)
         self.fast_frequency = _float('fast_frequency', 200.0)
         self.fast_dt        = 1.0 / self.fast_frequency if self.fast_frequency > 0 else 0.005
+        self.fast_legacy_frame = _bool('fast_legacy_frame', False)
 
         print(f"[{sec}] Config: object={self.object_name}:{self.port} "
               f"zenoh_key={self.zenoh_key} on={self.on} "
               f"frequency={self.frequency}Hz latency={self.latency}s "
-              f"fast={'on:'+self.fast_key if self.fast_enable else 'off'}")
+              f"fast={'on:'+self.fast_key if self.fast_enable else 'off'}"
+              f"{' [fast:legacy_frame]' if self.fast_enable and self.fast_legacy_frame else ''}")
 
     def open(self):
         vrpn_name = f"{self.object_name}:{self.port}"
@@ -202,7 +227,13 @@ class ObjectTracker:
             print(f"[{self.section}] Failed to open: {e}")
             self.on = False
 
-    def _to_pose(self, x_v, R_vm):
+    def _to_pose_ned(self, x_v, R_vm):
+        """NED/IMU-frame pose: x_n = R_nv @ x_v, R_ni = R_nv @ R_vm @ R_im."""
+        x = self.R_nv @ x_v
+        R = self.R_nv @ R_vm @ self.R_im
+        return x, R
+
+    def _to_pose_legacy(self, x_v, R_vm):
         x = self.R_sv @ x_v
         x[0] = -x[0]; x[1] = -x[1]
         R = self.R_off @ self.R_sv @ R_vm
@@ -236,12 +267,18 @@ class ObjectTracker:
             if (now_mono - self._fast_last_mono) / 1e9 >= self.fast_dt:
                 x_v, R_vm = self._vicon.loop()
                 x_v, R_vm = np.array(x_v), np.array(R_vm)
-                xf, Rf = self._to_pose(x_v, R_vm)
-                # Update shared clean pose
-                self.x_clean_latest = xf.copy()
-                self.R_clean_latest = Rf.copy()
+                # NED pose always computed; feeds x_clean_latest (used by RelativePosePublisher)
+                # regardless of which frame is actually published on fast_key below.
+                x_ned, R_ned = self._to_pose_ned(x_v, R_vm)
+                self.x_clean_latest = x_ned.copy()
+                self.R_clean_latest = R_ned.copy()
                 self.timestamp_clean_latest = ts_ns
                 self.has_data = True
+
+                if self.fast_legacy_frame:
+                    xf, Rf = self._to_pose_legacy(x_v, R_vm)
+                else:
+                    xf, Rf = x_ned, R_ned
                 pose_data = [[float(Rf[i, j]) for j in range(3)] + [float(xf[i])] for i in range(3)]
                 payload = {'image_taken_time': ts_ns, 'pose': pose_data,
                            'noise_x': [0.0]*3, 'noise_angles': [0.0]*3}
@@ -255,7 +292,8 @@ class ObjectTracker:
         if (now_mono - self._last_collect_mono) / 1e9 >= self.dt_desired:
             x_v, R_vm = self._vicon.loop()
             x_v, R_vm = np.array(x_v), np.array(R_vm)
-            x_raw, R_raw = self._to_pose(x_v, R_vm)
+            # NED/IMU-frame pose (always applied on the main path for both Base and Rover)
+            x_raw, R_raw = self._to_pose_ned(x_v, R_vm)
 
             if not self.fast_enable:
                 self.x_clean_latest = x_raw.copy()
@@ -334,14 +372,22 @@ class RelativePosePublisher:
         self.fast_dt = 1.0 / 200.0
         self.gt_state_key = 'fdcl/rel_gt_state'
         self.gt_state_enable = False
+        # Published at its own independent rate (gt_freq), decoupled from `frequency` above
+        self.gt_freq = 5.0
+        self.gt_dt_desired = 0.2
         self.gt_transform_enable = False
         self.T_gt = np.eye(3)
         self.kf_q_pos = 0.01
         self.kf_r_pos = 1e-6
         self.kf_q_omega = 0.5
         self.kf_r_omega = 0.04
-        self.vel_smooth_alpha = 0.3
-        self.omega_smooth_alpha = 0.3
+        # Spike rejection: clip innovation to this many sigma. 0 disables gating.
+        self.kf_gate_sigma_pos = 5.0
+        self.kf_gate_sigma_omega = 5.0
+        # EMA post-filter time constants (seconds) — rate-invariant, unlike a fixed
+        # per-sample alpha. Effective alpha = 1 - exp(-dt/tau).
+        self.vel_smooth_tau_sec = 0.5
+        self.omega_smooth_tau_sec = 0.3
 
         self._kf_pos   = [KalmanCA1D() for _ in range(3)]
         self._kf_omega = [KalmanCV1D() for _ in range(3)]
@@ -355,6 +401,7 @@ class RelativePosePublisher:
         self._pose_buffer = queue.Queue()
         self._last_collect_mono = time.monotonic_ns()
         self._fast_last_mono = time.monotonic_ns()
+        self._gt_last_mono = time.monotonic_ns()
         self._session = None
         self._publisher = None
         self._fast_publisher = None
@@ -371,7 +418,9 @@ class RelativePosePublisher:
             except ValueError: return default
 
         self.on                 = _bool('on', False)
-        self.meas_type          = cfg.get('Measurement_type', 'rover2base').strip()
+        # left = rover2base (default), right = base2rover
+        raw_meas_type           = cfg.get('Measurement_type', 'rover2base').strip()
+        self.meas_type          = 'base2rover' if raw_meas_type in ('base2rover', 'right') else 'rover2base'
         self.zenoh_key          = cfg.get('zenoh_key', self.zenoh_key)
         self.latency            = _float('latency', 0.0)
         self.frequency          = _float('frequency', 5.0)
@@ -387,13 +436,17 @@ class RelativePosePublisher:
         self.fast_dt            = 1.0 / self.fast_frequency if self.fast_frequency > 0 else 0.005
         self.gt_state_key       = cfg.get('gt_state_key', self.gt_state_key)
         self.gt_state_enable    = _bool('gt_state_enable', False)
+        self.gt_freq            = _float('gt_freq', 5.0)
+        self.gt_dt_desired      = 1.0 / self.gt_freq if self.gt_freq > 0 else 0.2
         self.gt_transform_enable = _bool('gt_transform_enable', False)
         self.kf_q_pos           = _float('kf_q_pos', 0.01)
         self.kf_r_pos           = _float('kf_r_pos', 1e-6)
         self.kf_q_omega         = _float('kf_q_omega', 0.5)
         self.kf_r_omega         = _float('kf_r_omega', 0.04)
-        self.vel_smooth_alpha   = _float('vel_smooth_alpha', 0.3)
-        self.omega_smooth_alpha = _float('omega_smooth_alpha', 0.3)
+        self.kf_gate_sigma_pos   = _float('kf_gate_sigma_pos', 5.0)
+        self.kf_gate_sigma_omega = _float('kf_gate_sigma_omega', 5.0)
+        self.vel_smooth_tau_sec   = _float('vel_smooth_tau_sec', 0.5)
+        self.omega_smooth_tau_sec = _float('omega_smooth_tau_sec', 0.3)
 
         mat_str = cfg.get('gt_transform_matrix', '')
         if mat_str:
@@ -441,7 +494,8 @@ class RelativePosePublisher:
             return
         if not self._gt_has_prev:
             for ax in range(3):
-                self._kf_pos[ax].update(x_rel[ax], self.dt_desired, self.kf_q_pos, self.kf_r_pos)
+                self._kf_pos[ax].update(x_rel[ax], self.dt_desired, self.kf_q_pos, self.kf_r_pos,
+                                         self.kf_gate_sigma_pos)
             self._R_gt_prev = R_rel.copy()
             self._gt_prev_ts = ts_sec
             self._gt_has_prev = True
@@ -451,23 +505,29 @@ class RelativePosePublisher:
         if dt <= 1e-6:
             return
 
-        v_filt = np.array([self._kf_pos[ax].update(x_rel[ax], dt, self.kf_q_pos, self.kf_r_pos)
+        v_filt = np.array([self._kf_pos[ax].update(x_rel[ax], dt, self.kf_q_pos, self.kf_r_pos,
+                                                     self.kf_gate_sigma_pos)
                            for ax in range(3)])
 
         Sk = R_rel.T @ ((R_rel - self._R_gt_prev) / dt)
         omega_raw = np.array([(Sk[2,1] - Sk[1,2]) / 2.0,
                                (Sk[0,2] - Sk[2,0]) / 2.0,
                                (Sk[1,0] - Sk[0,1]) / 2.0])
-        omega_filt = np.array([self._kf_omega[ax].update(omega_raw[ax], dt, self.kf_q_omega, self.kf_r_omega)
+        omega_filt = np.array([self._kf_omega[ax].update(omega_raw[ax], dt, self.kf_q_omega, self.kf_r_omega,
+                                                           self.kf_gate_sigma_omega)
                                for ax in range(3)])
 
+        # EMA post-filter: alpha derived from a fixed time constant + actual dt, so
+        # smoothing strength stays consistent regardless of gt_freq.
         if not self._smooth_init:
             self._v_smooth = v_filt.copy()
             self._w_smooth = omega_filt.copy()
             self._smooth_init = True
         else:
-            v_filt     = self.vel_smooth_alpha   * v_filt     + (1.0 - self.vel_smooth_alpha)   * self._v_smooth
-            omega_filt = self.omega_smooth_alpha * omega_filt + (1.0 - self.omega_smooth_alpha) * self._w_smooth
+            vel_alpha   = 1.0 - np.exp(-dt / self.vel_smooth_tau_sec)
+            omega_alpha = 1.0 - np.exp(-dt / self.omega_smooth_tau_sec)
+            v_filt     = vel_alpha   * v_filt     + (1.0 - vel_alpha)   * self._v_smooth
+            omega_filt = omega_alpha * omega_filt + (1.0 - omega_alpha) * self._w_smooth
             self._v_smooth = v_filt.copy()
             self._w_smooth = omega_filt.copy()
 
@@ -533,14 +593,21 @@ class RelativePosePublisher:
                     print(f"[Relative] Fast publish error: {e}")
                 self._fast_last_mono = now_mono
 
+        # GT state: published at its own independent rate (gt_freq), decoupled from
+        # the noisy zenoh_key topic's rate. Always uses clean, noise-free relative pose.
+        if self.gt_state_enable and self._gt_pub:
+            if (now_mono - self._gt_last_mono) / 1e9 >= self.gt_dt_desired:
+                x_gt_clean, R_gt_clean = self._compute_relative(
+                    self._base.x_clean_latest,  self._base.R_clean_latest,
+                    self._rover.x_clean_latest, self._rover.R_clean_latest)
+                self._publish_gt_state(x_gt_clean, R_gt_clean, ts_ns / 1e9)
+                self._gt_last_mono = now_mono
+
         # Main path
         if (now_mono - self._last_collect_mono) / 1e9 >= self.dt_desired:
             x_rel_clean, R_rel_clean = self._compute_relative(
                 self._base.x_clean_latest,  self._base.R_clean_latest,
                 self._rover.x_clean_latest, self._rover.R_clean_latest)
-
-            if self.gt_state_enable:
-                self._publish_gt_state(x_rel_clean, R_rel_clean, ts_ns / 1e9)
 
             R_use = -np.eye(3) if self.position_only else R_rel_clean.copy()
             x_noisy, R_noisy, noise_x, noise_ang = self._apply_noise(x_rel_clean.copy(), R_use)
@@ -612,7 +679,10 @@ def main():
             if base.on:  base.loop()
             if rover.on: rover.loop()
             if rel.on:   rel.loop()
-            time.sleep(0.001)
+            # Tighter poll than 1ms so 200Hz deadlines (5ms period) aren't missed by a
+            # large margin; note Python's interpreter/GIL overhead means this will still
+            # track 200Hz less tightly than the C++ build.
+            time.sleep(0.0001)
     except KeyboardInterrupt:
         print("Stopping...")
     finally:

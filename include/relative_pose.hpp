@@ -13,11 +13,14 @@
 // ── Kalman filters (used only by RelativePose for velocity estimation) ──────
 
 // 1-D Constant-Acceleration Kalman filter  state: [pos, vel, acc]  meas: pos
+// gate_sigma > 0 clips the innovation to gate_sigma * sqrt(S) before applying the
+// Kalman gain, so a single glitched/occluded measurement can't inject a step change
+// (spike) into the state; 0 disables gating.
 struct KalmanCA1D {
     Eigen::Vector3d x = Eigen::Vector3d::Zero();
     Eigen::Matrix3d P = Eigen::Matrix3d::Identity() * 10.0;
     bool initialized  = false;
-    double update(double z, double dt, double q, double r);
+    double update(double z, double dt, double q, double r, double gate_sigma = 0.0);
 };
 
 // 1-D Constant-Velocity Kalman filter  state: [omega, alpha]  meas: omega
@@ -25,7 +28,7 @@ struct KalmanCV1D {
     Eigen::Vector2d x = Eigen::Vector2d::Zero();
     Eigen::Matrix2d P = Eigen::Matrix2d::Identity() * 10.0;
     bool initialized  = false;
-    double update(double z, double dt, double q, double r);
+    double update(double z, double dt, double q, double r, double gate_sigma = 0.0);
 };
 
 // ── RelativePose ─────────────────────────────────────────────────────────────
@@ -88,14 +91,26 @@ private:
     std::chrono::steady_clock::time_point fast_last_time;
 
     // GT state topic (gt_state_key and gt_state_enable are in public section)
+    // Published at its own independent rate (gt_freq), decoupled from the noisy
+    // zenoh_key topic's rate (frequency).
+    double gt_freq              = 5.0;
+    double gt_dt_desired        = 0.2;
+    std::chrono::steady_clock::time_point gt_last_time;
     bool gt_transform_enable    = false;
     Eigen::Matrix3d T_gt        = Eigen::Matrix3d::Identity();
     double kf_q_pos             = 0.01;
     double kf_r_pos             = 1e-6;
     double kf_q_omega           = 0.5;
     double kf_r_omega           = 0.04;
-    double vel_smooth_alpha     = 0.3;
-    double omega_smooth_alpha   = 0.3;
+    // Spike rejection: clip innovation to this many sigma before it can move the
+    // filter state. 0 disables gating.
+    double kf_gate_sigma_pos    = 5.0;
+    double kf_gate_sigma_omega  = 5.0;
+    // EMA post-filter smoothing, expressed as a time constant (seconds) rather than
+    // a fixed per-sample alpha, so smoothing strength stays consistent regardless of
+    // gt_freq. Effective alpha = 1 - exp(-dt / tau); larger tau = smoother, more lag.
+    double vel_smooth_tau_sec   = 0.5;
+    double omega_smooth_tau_sec = 0.3;
 
     KalmanCA1D kf_pos[3];
     KalmanCV1D kf_omega[3];

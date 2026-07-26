@@ -82,11 +82,14 @@ int main(int argc, char** argv) {
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
+    // Polled at ~100us instead of 1ms so 200Hz deadlines (5ms period) are checked
+    // with much tighter granularity — a 1ms poll interval alone eats ~20% of that
+    // budget in scheduling slack, which is what was capping achieved rate to ~173Hz.
     while (SYS_ON) {
         if (base_v2p.on)  base_v2p.loop();
         if (rover_v2p.on) rover_v2p.loop();
         if (rel_pose.on)  rel_pose.loop();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
     // ── Shutdown ──────────────────────────────────────────────────────────────

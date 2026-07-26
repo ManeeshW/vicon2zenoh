@@ -16,6 +16,12 @@ vicon2pose::vicon2pose()
     R_off << -1.0, 0.0, 0.0,
               0.0, -1.0, 0.0,
               0.0,  0.0, 1.0;
+    R_nv << -1.0, 0.0,  0.0,
+             0.0, 1.0,  0.0,
+             0.0, 0.0, -1.0;
+    R_im << 0.0, 1.0,  0.0,
+            1.0, 0.0,  0.0,
+            0.0, 0.0, -1.0;
 }
 
 vicon2pose::~vicon2pose() {
@@ -112,6 +118,8 @@ void vicon2pose::load_config(const std::string& config_file, const std::string& 
                 double ff = std::stod(val);
                 if (ff > 0.0) fast_dt = 1.0 / ff;
             } catch (...) {}
+        } else if (key == "fast_legacy_frame") {
+            fast_legacy_frame = (val == "true" || val == "1");
         }
     }
     file.close();
@@ -120,7 +128,8 @@ void vicon2pose::load_config(const std::string& config_file, const std::string& 
               << " zenoh_key=" << zenoh_key
               << " on=" << on << " frequency=" << frequency << "Hz"
               << " latency=" << latency << "s"
-              << " fast=" << (fast_enable ? fast_key : std::string("off")) << std::endl;
+              << " fast=" << (fast_enable ? fast_key : std::string("off"))
+              << (fast_enable && fast_legacy_frame ? " [fast:legacy_frame]" : "") << std::endl;
 }
 
 void vicon2pose::open() {
@@ -153,21 +162,39 @@ void vicon2pose::loop() {
     if (fast_enable && fast_publisher &&
         std::chrono::duration<double>(now - fast_last_collect_time).count() >= fast_dt) {
         auto [x_vf, R_vmf] = vicon_instance.loop();
-        Eigen::Vector3d xf = R_sv * x_vf;
-        xf(0) = -xf(0); xf(1) = -xf(1);
-        Eigen::Matrix3d Rf = R_off * R_sv * R_vmf;
+
+        // NED/IMU-frame pose: x_n = R_nv * x_v, R_ni = R_nv * R_vm * R_im.
+        // Always computed; feeds x_clean_latest (used by RelativePose) regardless
+        // of which frame is actually published on fast_key below.
+        Eigen::Vector3d x_ned = R_nv * x_vf;
+        Eigen::Matrix3d R_ned = R_nv * R_vmf * R_im;
 
         double tsf = static_cast<double>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
 
-        // Expose clean pose for RelativePose (updated at fast rate when enabled)
-        x_clean_latest = xf;
-        R_clean_latest = Rf;
+        // Expose clean NED pose for RelativePose (updated at fast rate when enabled)
+        x_clean_latest = x_ned;
+        R_clean_latest = R_ned;
         timestamp_clean_latest = tsf;
         has_data = true;
 
-        if (display_snap) display_snap->update(xf, Rf);
+        // Published fast pose: NED by default; legacy frame if fast_legacy_frame is set
+        // (used to keep fdcl/pose_sync_fast unchanged for flying the drone).
+        Eigen::Vector3d xf;
+        Eigen::Matrix3d Rf;
+        if (fast_legacy_frame) {
+            xf = R_sv * x_vf;
+            xf(0) = -xf(0); xf(1) = -xf(1);
+            Rf = R_off * R_sv * R_vmf;
+        } else {
+            xf = x_ned;
+            Rf = R_ned;
+        }
+
+        // Display always shows the NED pose (matches zenoh_key/x_clean_latest semantics),
+        // independent of what fast_legacy_frame publishes on fast_key.
+        if (display_snap) display_snap->update(x_ned, R_ned);
 
         std::vector<std::vector<double>> pose_fast(3, std::vector<double>(4));
         for (int i = 0; i < 3; ++i) {
@@ -190,9 +217,9 @@ void vicon2pose::loop() {
     if (std::chrono::duration<double>(now - last_collect_time).count() >= dt_desired) {
         auto [x_v, R_vm] = vicon_instance.loop();
 
-        Eigen::Vector3d x_raw = R_sv * x_v;
-        x_raw(0) = -x_raw(0); x_raw(1) = -x_raw(1);
-        Eigen::Matrix3d R_raw = R_off * R_sv * R_vm;
+        // NED/IMU-frame pose (always applied on the main path for both Base and Rover)
+        Eigen::Vector3d x_raw = R_nv * x_v;
+        Eigen::Matrix3d R_raw = R_nv * R_vm * R_im;
 
         double ts = static_cast<double>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(

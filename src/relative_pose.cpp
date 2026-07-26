@@ -4,9 +4,20 @@
 #include <sstream>
 #include <chrono>
 #include <thread>
+#include <cmath>
+
+// Clip innovation to +/- gate_sigma*sqrt(S) so a single glitched measurement can't
+// inject a step change into the filter state. gate_sigma <= 0 disables gating.
+static double gate_innovation(double innovation, double S, double gate_sigma) {
+    if (gate_sigma <= 0.0) return innovation;
+    double bound = gate_sigma * std::sqrt(S);
+    if (innovation >  bound) return  bound;
+    if (innovation < -bound) return -bound;
+    return innovation;
+}
 
 // ── KalmanCA1D ──────────────────────────────────────────────────────────────
-double KalmanCA1D::update(double z, double dt, double q, double r) {
+double KalmanCA1D::update(double z, double dt, double q, double r, double gate_sigma) {
     if (!initialized) {
         x(0) = z; x(1) = 0.0; x(2) = 0.0;
         initialized = true;
@@ -25,14 +36,15 @@ double KalmanCA1D::update(double z, double dt, double q, double r) {
     x = F * x;
     P = F * P * F.transpose() + Q;
     double S = P(0,0) + r;
+    double innovation = gate_innovation(z - x(0), S, gate_sigma);
     Eigen::Vector3d K = P.col(0) / S;
-    x += K * (z - x(0));
+    x += K * innovation;
     P -= K * P.row(0);
     return x(1);
 }
 
 // ── KalmanCV1D ──────────────────────────────────────────────────────────────
-double KalmanCV1D::update(double z, double dt, double q, double r) {
+double KalmanCV1D::update(double z, double dt, double q, double r, double gate_sigma) {
     if (!initialized) {
         x(0) = z; x(1) = 0.0;
         initialized = true;
@@ -49,8 +61,9 @@ double KalmanCV1D::update(double z, double dt, double q, double r) {
     x = F * x;
     P = F * P * F.transpose() + Q;
     double S = P(0,0) + r;
+    double innovation = gate_innovation(z - x(0), S, gate_sigma);
     Eigen::Vector2d K = P.col(0) / S;
-    x += K * (z - x(0));
+    x += K * innovation;
     P -= K * P.row(0);
     return x(0);
 }
@@ -61,6 +74,7 @@ RelativePose::RelativePose(vicon2pose& base, vicon2pose& rover)
     : base_(base), rover_(rover),
       fast_last_time(std::chrono::steady_clock::now()),
       last_collect_time(std::chrono::steady_clock::now()),
+      gt_last_time(std::chrono::steady_clock::now()),
       rng(std::random_device{}()), dist(0.0, 1.0) {}
 
 RelativePose::~RelativePose() {
@@ -119,7 +133,9 @@ void RelativePose::load_config(const std::string& config_file) {
         if (key == "on") {
             on = (val == "true" || val == "1");
         } else if (key == "Measurement_type") {
-            meas_type_ = (val == "base2rover") ? MeasType::BASE2ROVER : MeasType::ROVER2BASE;
+            // left  = rover2base (rover pose expressed in base/body frame) — default
+            // right = base2rover (base pose expressed in rover frame)
+            meas_type_ = (val == "base2rover" || val == "right") ? MeasType::BASE2ROVER : MeasType::ROVER2BASE;
         } else if (key == "zenoh_key") {
             zenoh_key = val;
         } else if (key == "latency") {
@@ -147,6 +163,11 @@ void RelativePose::load_config(const std::string& config_file) {
             gt_state_key = val;
         } else if (key == "gt_state_enable") {
             gt_state_enable = (val == "true" || val == "1");
+        } else if (key == "gt_freq") {
+            try {
+                double gf = std::stod(val);
+                if (gf > 0.0) { gt_freq = gf; gt_dt_desired = 1.0 / gf; }
+            } catch (...) {}
         } else if (key == "gt_transform_enable") {
             gt_transform_enable = (val == "true" || val == "1");
         } else if (key == "gt_transform_matrix") {
@@ -173,10 +194,14 @@ void RelativePose::load_config(const std::string& config_file) {
             try { kf_q_omega = std::stod(val); } catch (...) {}
         } else if (key == "kf_r_omega") {
             try { kf_r_omega = std::stod(val); } catch (...) {}
-        } else if (key == "vel_smooth_alpha") {
-            try { vel_smooth_alpha = std::stod(val); } catch (...) {}
-        } else if (key == "omega_smooth_alpha") {
-            try { omega_smooth_alpha = std::stod(val); } catch (...) {}
+        } else if (key == "kf_gate_sigma_pos") {
+            try { kf_gate_sigma_pos = std::stod(val); } catch (...) {}
+        } else if (key == "kf_gate_sigma_omega") {
+            try { kf_gate_sigma_omega = std::stod(val); } catch (...) {}
+        } else if (key == "vel_smooth_tau_sec") {
+            try { vel_smooth_tau_sec = std::stod(val); } catch (...) {}
+        } else if (key == "omega_smooth_tau_sec") {
+            try { omega_smooth_tau_sec = std::stod(val); } catch (...) {}
         }
     }
     file.close();
@@ -187,7 +212,8 @@ void RelativePose::load_config(const std::string& config_file) {
               << " on=" << on << " frequency=" << frequency << "Hz"
               << " latency=" << latency << "s"
               << " fast=" << (fast_enable ? fast_key : std::string("off"))
-              << " gt=" << (gt_state_enable ? gt_state_key : std::string("off")) << std::endl;
+              << " gt=" << (gt_state_enable ? gt_state_key : std::string("off"))
+              << (gt_state_enable ? (" @" + std::to_string(gt_freq) + "Hz") : std::string()) << std::endl;
 }
 
 void RelativePose::open() {
@@ -230,7 +256,7 @@ void RelativePose::publish_gt_state(const Eigen::Vector3d& x_rel, const Eigen::M
 
     if (!gt_has_prev) {
         for (int ax = 0; ax < 3; ++ax)
-            kf_pos[ax].update(x_rel(ax), dt_desired, kf_q_pos, kf_r_pos);
+            kf_pos[ax].update(x_rel(ax), dt_desired, kf_q_pos, kf_r_pos, kf_gate_sigma_pos);
         R_gt_prev  = R_rel;
         gt_prev_ts = ts_sec;
         gt_has_prev = true;
@@ -242,7 +268,7 @@ void RelativePose::publish_gt_state(const Eigen::Vector3d& x_rel, const Eigen::M
 
     Eigen::Vector3d v_filt;
     for (int ax = 0; ax < 3; ++ax)
-        v_filt(ax) = kf_pos[ax].update(x_rel(ax), dt, kf_q_pos, kf_r_pos);
+        v_filt(ax) = kf_pos[ax].update(x_rel(ax), dt, kf_q_pos, kf_r_pos, kf_gate_sigma_pos);
 
     // Angular velocity from finite-difference of R_rel
     Eigen::Matrix3d Sk = R_rel.transpose() * ((R_rel - R_gt_prev) / dt);
@@ -252,16 +278,20 @@ void RelativePose::publish_gt_state(const Eigen::Vector3d& x_rel, const Eigen::M
         (Sk(1,0) - Sk(0,1)) / 2.0);
     Eigen::Vector3d omega_filt;
     for (int ax = 0; ax < 3; ++ax)
-        omega_filt(ax) = kf_omega[ax].update(omega_raw(ax), dt, kf_q_omega, kf_r_omega);
+        omega_filt(ax) = kf_omega[ax].update(omega_raw(ax), dt, kf_q_omega, kf_r_omega, kf_gate_sigma_omega);
 
-    // EMA post-filter
+    // EMA post-filter: alpha derived from a fixed time constant + actual dt, so
+    // smoothing strength stays consistent regardless of gt_freq (a fixed alpha would
+    // give 40x less real-time smoothing at 200Hz than at 5Hz for the same value).
+    double vel_alpha   = 1.0 - std::exp(-dt / vel_smooth_tau_sec);
+    double omega_alpha = 1.0 - std::exp(-dt / omega_smooth_tau_sec);
     if (!smooth_has_prev) {
         v_smooth_prev     = v_filt;
         omega_smooth_prev = omega_filt;
         smooth_has_prev   = true;
     } else {
-        v_filt     = vel_smooth_alpha   * v_filt     + (1.0 - vel_smooth_alpha)   * v_smooth_prev;
-        omega_filt = omega_smooth_alpha * omega_filt + (1.0 - omega_smooth_alpha) * omega_smooth_prev;
+        v_filt     = vel_alpha   * v_filt     + (1.0 - vel_alpha)   * v_smooth_prev;
+        omega_filt = omega_alpha * omega_filt + (1.0 - omega_alpha) * omega_smooth_prev;
         v_smooth_prev     = v_filt;
         omega_smooth_prev = omega_filt;
     }
@@ -336,6 +366,22 @@ void RelativePose::loop() {
         fast_last_time = now;
     }
 
+    // GT state: published at its own independent rate (gt_freq), decoupled from
+    // the noisy zenoh_key topic's rate. Always uses clean, noise-free relative pose.
+    if (gt_state_enable && gt_state_pub &&
+        std::chrono::duration<double>(now - gt_last_time).count() >= gt_dt_desired) {
+        auto [x_gt_clean, R_gt_clean] = compute_relative(
+            base_.x_clean_latest, base_.R_clean_latest,
+            rover_.x_clean_latest, rover_.R_clean_latest);
+
+        double ts_gt = static_cast<double>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
+        publish_gt_state(x_gt_clean, R_gt_clean, ts_gt / 1e9);
+        gt_last_time = now;
+    }
+
     // Main path: collect at configured frequency
     if (std::chrono::duration<double>(now - last_collect_time).count() >= dt_desired) {
         auto [x_rel_clean, R_rel_clean] = compute_relative(
@@ -345,10 +391,6 @@ void RelativePose::loop() {
         double ts = static_cast<double>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-
-        // GT state (always uses clean, noise-free relative pose)
-        if (gt_state_enable)
-            publish_gt_state(x_rel_clean, R_rel_clean, ts / 1e9);
 
         PoseData data;
         data.x_pose       = x_rel_clean;
