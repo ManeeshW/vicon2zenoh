@@ -4,32 +4,14 @@
 #include "vicon2pose.hpp"
 #include <zenoh.hxx>
 #include <Eigen/Dense>
+#include <Eigen/Geometry>
 #include <chrono>
 #include <string>
 #include <queue>
+#include <deque>
+#include <functional>
 #include <random>
 #include <nlohmann/json.hpp>
-
-// ── Kalman filters (used only by RelativePose for velocity estimation) ──────
-
-// 1-D Constant-Acceleration Kalman filter  state: [pos, vel, acc]  meas: pos
-// gate_sigma > 0 clips the innovation to gate_sigma * sqrt(S) before applying the
-// Kalman gain, so a single glitched/occluded measurement can't inject a step change
-// (spike) into the state; 0 disables gating.
-struct KalmanCA1D {
-    Eigen::Vector3d x = Eigen::Vector3d::Zero();
-    Eigen::Matrix3d P = Eigen::Matrix3d::Identity() * 10.0;
-    bool initialized  = false;
-    double update(double z, double dt, double q, double r, double gate_sigma = 0.0);
-};
-
-// 1-D Constant-Velocity Kalman filter  state: [omega, alpha]  meas: omega
-struct KalmanCV1D {
-    Eigen::Vector2d x = Eigen::Vector2d::Zero();
-    Eigen::Matrix2d P = Eigen::Matrix2d::Identity() * 10.0;
-    bool initialized  = false;
-    double update(double z, double dt, double q, double r, double gate_sigma = 0.0);
-};
 
 // ── RelativePose ─────────────────────────────────────────────────────────────
 //
@@ -40,7 +22,7 @@ struct KalmanCV1D {
 // Zenoh topics:
 //   zenoh_key  — noisy, latency-delayed pose  (same JSON schema as vicon2pose)
 //   fast_key   — clean, zero-latency fast pose
-//   gt_state_key — Kalman-filtered pos/vel/R/omega of the relative pose
+//   gt_state_key — Savitzky–Golay smoothed pos/vel/R/omega of the relative pose
 //
 class RelativePose {
 public:
@@ -98,28 +80,33 @@ private:
     std::chrono::steady_clock::time_point gt_last_time;
     bool gt_transform_enable    = false;
     Eigen::Matrix3d T_gt        = Eigen::Matrix3d::Identity();
-    double kf_q_pos             = 0.01;
-    double kf_r_pos             = 1e-6;
-    double kf_q_omega           = 0.5;
-    double kf_r_omega           = 0.04;
-    // Spike rejection: clip innovation to this many sigma before it can move the
-    // filter state. 0 disables gating.
-    double kf_gate_sigma_pos    = 5.0;
-    double kf_gate_sigma_omega  = 5.0;
-    // EMA post-filter smoothing, expressed as a time constant (seconds) rather than
-    // a fixed per-sample alpha, so smoothing strength stays consistent regardless of
-    // gt_freq. Effective alpha = 1 - exp(-dt / tau); larger tau = smoother, more lag.
-    double vel_smooth_tau_sec   = 0.5;
-    double omega_smooth_tau_sec = 0.3;
 
-    KalmanCA1D kf_pos[3];
-    KalmanCV1D kf_omega[3];
-    Eigen::Vector3d v_smooth_prev     = Eigen::Vector3d::Zero();
-    Eigen::Vector3d omega_smooth_prev = Eigen::Vector3d::Zero();
-    bool smooth_has_prev  = false;
-    Eigen::Matrix3d R_gt_prev = Eigen::Matrix3d::Identity();
-    double gt_prev_ts    = 0.0;
-    bool gt_has_prev     = false;
+    // Savitzky–Golay differentiator for the GT state: a sliding window of clean
+    // relative-pose samples is fitted with a least-squares polynomial (in actual
+    // time, robust to loop jitter) and evaluated at the window CENTER. Smoothed
+    // value = poly(t_center), derivative = d(poly)/dt(t_center). This yields an
+    // ultrasmooth, essentially noiseless velocity at the cost of a fixed latency
+    // of half the window (published timestamp = center sample's real time, so
+    // consumers can time-align). sg_window must be odd and >= sg_order + 2.
+    int    sg_window     = 21;    // odd; span = sg_window/gt_freq, latency = half
+    int    sg_order      = 3;     // polynomial order of the fit
+    double sg_max_jump_m = 0.5;   // drop samples stepping farther than this from the
+                                  // last accepted sample (Vicon occlusion glitches);
+                                  // <= 0 disables the guard
+
+    struct SgSample {
+        double t;                 // real timestamp (s)
+        Eigen::Vector3d x;        // relative position
+        Eigen::Quaterniond q;     // relative attitude (hemisphere-continuous)
+    };
+    std::deque<SgSample> sg_buf;
+    bool sg_has_prev_q = false;
+    Eigen::Quaterniond sg_prev_q = Eigen::Quaterniond::Identity();
+
+    // Least-squares polynomial fit (order sg_order, in tau = t - t_center) of one
+    // channel over sg_buf, returning {value, derivative} at the window center.
+    std::pair<double, double> sg_fit_center(
+        const std::function<double(const SgSample&)>& channel) const;
 
     // Zenoh
     std::optional<zenoh::Session>   session;

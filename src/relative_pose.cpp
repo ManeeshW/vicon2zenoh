@@ -6,66 +6,27 @@
 #include <thread>
 #include <cmath>
 
-// Clip innovation to +/- gate_sigma*sqrt(S) so a single glitched measurement can't
-// inject a step change into the filter state. gate_sigma <= 0 disables gating.
-static double gate_innovation(double innovation, double S, double gate_sigma) {
-    if (gate_sigma <= 0.0) return innovation;
-    double bound = gate_sigma * std::sqrt(S);
-    if (innovation >  bound) return  bound;
-    if (innovation < -bound) return -bound;
-    return innovation;
-}
-
-// ── KalmanCA1D ──────────────────────────────────────────────────────────────
-double KalmanCA1D::update(double z, double dt, double q, double r, double gate_sigma) {
-    if (!initialized) {
-        x(0) = z; x(1) = 0.0; x(2) = 0.0;
-        initialized = true;
-        return 0.0;
+// ── Savitzky–Golay fit helper ────────────────────────────────────────────────
+// Least-squares fit of a polynomial of order sg_order to one channel of the
+// window samples, in tau = t - t_center. Returns {value, derivative} evaluated
+// at the window center (tau = 0), i.e. coefficients c0 and c1 of the fit.
+// Fitting against actual timestamps makes the derivative robust to the small
+// period jitter of the publish loop.
+std::pair<double, double> RelativePose::sg_fit_center(
+    const std::function<double(const SgSample&)>& channel) const {
+    const int n = static_cast<int>(sg_buf.size());
+    const int c = n / 2;                 // center index (n is odd)
+    const double tc = sg_buf[c].t;
+    Eigen::MatrixXd V(n, sg_order + 1);
+    Eigen::VectorXd y(n);
+    for (int i = 0; i < n; ++i) {
+        double tau = sg_buf[i].t - tc;
+        double p = 1.0;
+        for (int k = 0; k <= sg_order; ++k) { V(i, k) = p; p *= tau; }
+        y(i) = channel(sg_buf[i]);
     }
-    double dt2 = dt*dt, dt3 = dt2*dt, dt4 = dt3*dt, dt5 = dt4*dt;
-    Eigen::Matrix3d F;
-    F << 1, dt, 0.5*dt2,
-         0,  1,      dt,
-         0,  0,       1;
-    Eigen::Matrix3d Q;
-    Q << dt5/20.0, dt4/8.0, dt3/6.0,
-         dt4/8.0,  dt3/3.0, dt2/2.0,
-         dt3/6.0,  dt2/2.0,      dt;
-    Q *= q;
-    x = F * x;
-    P = F * P * F.transpose() + Q;
-    double S = P(0,0) + r;
-    double innovation = gate_innovation(z - x(0), S, gate_sigma);
-    Eigen::Vector3d K = P.col(0) / S;
-    x += K * innovation;
-    P -= K * P.row(0);
-    return x(1);
-}
-
-// ── KalmanCV1D ──────────────────────────────────────────────────────────────
-double KalmanCV1D::update(double z, double dt, double q, double r, double gate_sigma) {
-    if (!initialized) {
-        x(0) = z; x(1) = 0.0;
-        initialized = true;
-        return z;
-    }
-    double dt2 = dt*dt, dt3 = dt2*dt;
-    Eigen::Matrix2d F;
-    F << 1, dt,
-         0,  1;
-    Eigen::Matrix2d Q;
-    Q << dt3/3.0, dt2/2.0,
-         dt2/2.0,      dt;
-    Q *= q;
-    x = F * x;
-    P = F * P * F.transpose() + Q;
-    double S = P(0,0) + r;
-    double innovation = gate_innovation(z - x(0), S, gate_sigma);
-    Eigen::Vector2d K = P.col(0) / S;
-    x += K * innovation;
-    P -= K * P.row(0);
-    return x(0);
+    Eigen::VectorXd coef = V.colPivHouseholderQr().solve(y);
+    return {coef(0), coef(1)};
 }
 
 // ── RelativePose ─────────────────────────────────────────────────────────────
@@ -186,22 +147,21 @@ void RelativePose::load_config(const std::string& config_file) {
                         T_gt(ri, ci) = vals[ri*3 + ci];
             else
                 std::cerr << "[Relative] gt_transform_matrix needs 9 values, got " << vals.size() << std::endl;
-        } else if (key == "kf_q_pos") {
-            try { kf_q_pos = std::stod(val); } catch (...) {}
-        } else if (key == "kf_r_pos") {
-            try { kf_r_pos = std::stod(val); } catch (...) {}
-        } else if (key == "kf_q_omega") {
-            try { kf_q_omega = std::stod(val); } catch (...) {}
-        } else if (key == "kf_r_omega") {
-            try { kf_r_omega = std::stod(val); } catch (...) {}
-        } else if (key == "kf_gate_sigma_pos") {
-            try { kf_gate_sigma_pos = std::stod(val); } catch (...) {}
-        } else if (key == "kf_gate_sigma_omega") {
-            try { kf_gate_sigma_omega = std::stod(val); } catch (...) {}
-        } else if (key == "vel_smooth_tau_sec") {
-            try { vel_smooth_tau_sec = std::stod(val); } catch (...) {}
-        } else if (key == "omega_smooth_tau_sec") {
-            try { omega_smooth_tau_sec = std::stod(val); } catch (...) {}
+        } else if (key == "gt_sg_window") {
+            try {
+                int w = std::stoi(val);
+                if (w % 2 == 0) ++w;                    // window must be odd
+                if (w >= sg_order + 2) sg_window = w;
+                else std::cerr << "[Relative] gt_sg_window too small, keeping " << sg_window << std::endl;
+            } catch (...) {}
+        } else if (key == "gt_sg_order") {
+            try {
+                int p = std::stoi(val);
+                if (p >= 1 && p + 2 <= sg_window) sg_order = p;
+                else std::cerr << "[Relative] gt_sg_order invalid, keeping " << sg_order << std::endl;
+            } catch (...) {}
+        } else if (key == "gt_sg_max_jump_m") {
+            try { sg_max_jump_m = std::stod(val); } catch (...) {}
         }
     }
     file.close();
@@ -213,7 +173,8 @@ void RelativePose::load_config(const std::string& config_file) {
               << " latency=" << latency << "s"
               << " fast=" << (fast_enable ? fast_key : std::string("off"))
               << " gt=" << (gt_state_enable ? gt_state_key : std::string("off"))
-              << (gt_state_enable ? (" @" + std::to_string(gt_freq) + "Hz") : std::string()) << std::endl;
+              << (gt_state_enable ? (" @" + std::to_string(gt_freq) + "Hz") : std::string())
+              << (gt_state_enable ? (" sg=" + std::to_string(sg_window) + "/" + std::to_string(sg_order)) : std::string()) << std::endl;
 }
 
 void RelativePose::open() {
@@ -254,56 +215,52 @@ RelativePose::compute_relative(const Eigen::Vector3d& x_b, const Eigen::Matrix3d
 void RelativePose::publish_gt_state(const Eigen::Vector3d& x_rel, const Eigen::Matrix3d& R_rel, double ts_sec) {
     if (!gt_state_pub) return;
 
-    if (!gt_has_prev) {
-        for (int ax = 0; ax < 3; ++ax)
-            kf_pos[ax].update(x_rel(ax), dt_desired, kf_q_pos, kf_r_pos, kf_gate_sigma_pos);
-        R_gt_prev  = R_rel;
-        gt_prev_ts = ts_sec;
-        gt_has_prev = true;
+    // Glitch guard: drop samples that step implausibly far from the last accepted
+    // one (Vicon occlusion jumps) so they can't smear across the whole SG window.
+    if (sg_max_jump_m > 0.0 && !sg_buf.empty() &&
+        (x_rel - sg_buf.back().x).norm() > sg_max_jump_m)
         return;
+
+    // Push the clean sample; keep the quaternion hemisphere-continuous so the
+    // component-wise polynomial fit sees a smooth signal.
+    Eigen::Quaterniond q_rel(R_rel);
+    if (sg_has_prev_q && q_rel.coeffs().dot(sg_prev_q.coeffs()) < 0.0)
+        q_rel.coeffs() *= -1.0;
+    sg_prev_q     = q_rel;
+    sg_has_prev_q = true;
+    sg_buf.push_back({ts_sec, x_rel, q_rel});
+    if (static_cast<int>(sg_buf.size()) > sg_window) sg_buf.pop_front();
+    if (static_cast<int>(sg_buf.size()) < sg_window) return;   // window not full yet
+
+    // Fit each channel over the window; value + derivative at the window center.
+    Eigen::Vector3d pos_sm, vel_sm;
+    for (int ax = 0; ax < 3; ++ax) {
+        auto [v, d] = sg_fit_center([ax](const SgSample& s) { return s.x(ax); });
+        pos_sm(ax) = v; vel_sm(ax) = d;
     }
-
-    double dt = ts_sec - gt_prev_ts;
-    if (dt <= 1e-6) return;
-
-    Eigen::Vector3d v_filt;
-    for (int ax = 0; ax < 3; ++ax)
-        v_filt(ax) = kf_pos[ax].update(x_rel(ax), dt, kf_q_pos, kf_r_pos, kf_gate_sigma_pos);
-
-    // Angular velocity from finite-difference of R_rel
-    Eigen::Matrix3d Sk = R_rel.transpose() * ((R_rel - R_gt_prev) / dt);
-    Eigen::Vector3d omega_raw(
-        (Sk(2,1) - Sk(1,2)) / 2.0,
-        (Sk(0,2) - Sk(2,0)) / 2.0,
-        (Sk(1,0) - Sk(0,1)) / 2.0);
-    Eigen::Vector3d omega_filt;
-    for (int ax = 0; ax < 3; ++ax)
-        omega_filt(ax) = kf_omega[ax].update(omega_raw(ax), dt, kf_q_omega, kf_r_omega, kf_gate_sigma_omega);
-
-    // EMA post-filter: alpha derived from a fixed time constant + actual dt, so
-    // smoothing strength stays consistent regardless of gt_freq (a fixed alpha would
-    // give 40x less real-time smoothing at 200Hz than at 5Hz for the same value).
-    double vel_alpha   = 1.0 - std::exp(-dt / vel_smooth_tau_sec);
-    double omega_alpha = 1.0 - std::exp(-dt / omega_smooth_tau_sec);
-    if (!smooth_has_prev) {
-        v_smooth_prev     = v_filt;
-        omega_smooth_prev = omega_filt;
-        smooth_has_prev   = true;
-    } else {
-        v_filt     = vel_alpha   * v_filt     + (1.0 - vel_alpha)   * v_smooth_prev;
-        omega_filt = omega_alpha * omega_filt + (1.0 - omega_alpha) * omega_smooth_prev;
-        v_smooth_prev     = v_filt;
-        omega_smooth_prev = omega_filt;
+    // Quaternion coeffs() layout is (x, y, z, w); Quaterniond ctor takes (w, x, y, z).
+    Eigen::Vector4d qc_sm, qcd_sm;
+    for (int k = 0; k < 4; ++k) {
+        auto [v, d] = sg_fit_center([k](const SgSample& s) { return s.q.coeffs()(k); });
+        qc_sm(k) = v; qcd_sm(k) = d;
     }
+    Eigen::Quaterniond q_fit(qc_sm(3), qc_sm(0), qc_sm(1), qc_sm(2));
+    q_fit.normalize();
+    Eigen::Quaterniond q_dot(qcd_sm(3), qcd_sm(0), qcd_sm(1), qcd_sm(2));
 
-    R_gt_prev  = R_rel;
-    gt_prev_ts = ts_sec;
+    // Body-frame angular velocity: R_dot = R [w]x  <=>  w = 2 * vec(q* ⊗ q_dot).
+    // Same convention as the previous R^T*dR finite-difference estimate.
+    Eigen::Vector3d omega_sm = 2.0 * (q_fit.conjugate() * q_dot).vec();
+
+    // The published sample belongs to the window center: its timestamp is the
+    // center sample's real time (latency = half the window, explicit).
+    double ts_center = sg_buf[sg_buf.size() / 2].t;
 
     const Eigen::Matrix3d& T = gt_transform_enable ? T_gt : Eigen::Matrix3d::Identity();
-    Eigen::Vector3d pos_out   = T * x_rel;
-    Eigen::Vector3d vel_out   = T * v_filt;
-    Eigen::Matrix3d R_out     = T * R_rel * T.transpose();
-    Eigen::Vector3d omega_out = T * omega_filt;
+    Eigen::Vector3d pos_out   = T * pos_sm;
+    Eigen::Vector3d vel_out   = T * vel_sm;
+    Eigen::Matrix3d R_out     = T * q_fit.toRotationMatrix() * T.transpose();
+    Eigen::Vector3d omega_out = T * omega_sm;
 
     std::vector<std::vector<double>> R_mat(3, std::vector<double>(3));
     for (int ri = 0; ri < 3; ++ri)
@@ -311,7 +268,7 @@ void RelativePose::publish_gt_state(const Eigen::Vector3d& x_rel, const Eigen::M
             R_mat[ri][ci] = R_out(ri, ci);
 
     nlohmann::json jg;
-    jg["timestamp"] = ts_sec;
+    jg["timestamp"] = ts_center;
     jg["rel_pos"]   = {pos_out(0),   pos_out(1),   pos_out(2)};
     jg["rel_vel"]   = {vel_out(0),   vel_out(1),   vel_out(2)};
     jg["rel_R"]     = R_mat;
